@@ -93,12 +93,19 @@
             if (format === 'featureCounts') {
                 geneCol = 0;
                 dataStartCol = 6; // featureCounts: cols 1-5 are metadata (Chr, Start, End, Strand, Length)
-                headerRow = 0;
-                dataStartRow = 1;
+                
+                // featureCounts format: Row 0 is comment (#), Row 1 is header, Row 2+ is data
+                if (rows[0][0].startsWith('#')) {
+                    headerRow = 1;  // Header is in row 1
+                    dataStartRow = 2;  // Data starts at row 2
+                } else {
+                    headerRow = 0;  // No comment line, header is row 0
+                    dataStartRow = 1;
+                }
                 
                 document.getElementById('formatInfo').classList.remove('hidden');
                 document.getElementById('formatText').textContent = 
-                    `Detected: featureCounts output (skipping metadata columns 1-5)`;
+                    `Detected: featureCounts output (skipped comment row, using cols 7+)`;
             } else {
                 document.getElementById('formatInfo').classList.remove('hidden');
                 document.getElementById('formatText').textContent = 
