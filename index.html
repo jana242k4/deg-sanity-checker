@@ -72,40 +72,35 @@
 
     <script>
         function detectFormat(rows) {
-            // Check if featureCounts format
-            if (rows[0][0] === 'Geneid' || rows[0][0] === 'GeneID' || rows[0][0] === 'gene_id') {
-                return 'featureCounts';
+            // Find header row (handles comment lines)
+            const headerIdx = rows.findIndex(r => 
+                r.some(cell => cell === 'Geneid' || cell === 'GeneID' || cell === 'gene_id')
+            );
+            
+            if (headerIdx >= 0) {
+                const header = rows[headerIdx];
+                if (header.includes('Chr') && header.includes('Length') && header.includes('Strand')) {
+                    return { type: 'featureCounts', headerIdx };
+                }
             }
-            // Check if first column has typical gene names
-            if (rows.length > 1 && /^(ENS|NM_|Gene|gene)/.test(rows[1][0])) {
-                return 'standard';
-            }
-            return 'standard';
+            
+            return { type: 'standard', headerIdx: 0 };
         }
 
         function parseCountMatrix(rows) {
-            const format = detectFormat(rows);
+            const formatInfo = detectFormat(rows);
             let geneCol = 0;
             let dataStartCol = 1;
-            let headerRow = 0;
-            let dataStartRow = 1;
+            let headerRow = formatInfo.headerIdx;
+            let dataStartRow = headerRow + 1;
 
-            if (format === 'featureCounts') {
+            if (formatInfo.type === 'featureCounts') {
                 geneCol = 0;
-                dataStartCol = 6; // featureCounts: cols 1-5 are metadata (Chr, Start, End, Strand, Length)
-                
-                // featureCounts format: Row 0 is comment (#), Row 1 is header, Row 2+ is data
-                if (rows[0][0].startsWith('#')) {
-                    headerRow = 1;  // Header is in row 1
-                    dataStartRow = 2;  // Data starts at row 2
-                } else {
-                    headerRow = 0;  // No comment line, header is row 0
-                    dataStartRow = 1;
-                }
+                dataStartCol = 6; // featureCounts: cols 0-5 are Geneid, Chr, Start, End, Strand, Length
                 
                 document.getElementById('formatInfo').classList.remove('hidden');
                 document.getElementById('formatText').textContent = 
-                    `Detected: featureCounts output (skipped comment row, using cols 7+)`;
+                    `Detected: featureCounts output (header at row ${headerRow + 1}, skipping cols 1-6)`;
             } else {
                 document.getElementById('formatInfo').classList.remove('hidden');
                 document.getElementById('formatText').textContent = 
@@ -113,20 +108,22 @@
             }
 
             // Extract sample names from header
-            const sampleNames = rows[headerRow].slice(dataStartCol);
+            const sampleNames = rows[headerRow].slice(dataStartCol).filter(s => s && s.trim());
             
             // Extract count data
             const countData = [];
             for (let i = dataStartRow; i < rows.length; i++) {
                 if (rows[i].length <= dataStartCol) continue;
                 const geneName = rows[i][geneCol];
+                if (!geneName || geneName.startsWith('#')) continue; // Skip empty or comment rows
+                
                 const counts = rows[i].slice(dataStartCol).map(c => parseFloat(c) || 0);
-                if (geneName && counts.some(c => c > 0)) {
+                if (geneName && counts.length === sampleNames.length) {
                     countData.push({ gene: geneName, counts: counts });
                 }
             }
 
-            return { sampleNames, countData, format };
+            return { sampleNames, countData, format: formatInfo.type };
         }
 
         function analyzeData(parsedData) {
@@ -138,6 +135,31 @@
 
             const sampleCount = sampleNames.length;
             const geneCount = countData.length;
+
+            // CRITICAL: Hard stop if no samples detected
+            if (sampleCount === 0) {
+                return {
+                    flags: [{ msg: "No samples detected. Check file format: delimiter (space/tab/comma), header row, or column structure." }],
+                    warnings: [],
+                    passed: [],
+                    info: [{ msg: "Upload a proper count matrix or featureCounts output." }],
+                    libSizes: [],
+                    sampleNames: [],
+                    geneCount: countData.length
+                };
+            }
+
+            if (geneCount === 0) {
+                return {
+                    flags: [{ msg: "No genes detected. Check if data rows exist after header." }],
+                    warnings: [],
+                    passed: [],
+                    info: [],
+                    libSizes: [],
+                    sampleNames,
+                    geneCount: 0
+                };
+            }
 
             // SAMPLE SIZE CHECK (assumes balanced design)
             if (sampleCount < 6) {
@@ -365,9 +387,21 @@
         }
 
         function processFile(text) {
-            const rows = text.trim().split('\n').map(row => 
-                row.split(/[,\t]/).map(cell => cell.trim())
-            );
+            // First, filter out comment lines starting with #
+            const lines = text.trim().split('\n').filter(line => line.trim().length > 0);
+            
+            // Parse rows - support CSV, TSV, and space-delimited
+            const rows = lines.map(line => {
+                // Try to detect delimiter
+                if (line.includes('\t')) {
+                    return line.split('\t').map(cell => cell.trim());
+                } else if (line.includes(',')) {
+                    return line.split(',').map(cell => cell.trim());
+                } else {
+                    // Space-delimited (featureCounts default)
+                    return line.trim().split(/\s+/);
+                }
+            });
             
             document.getElementById('loading').classList.remove('hidden');
             document.getElementById('results').classList.add('hidden');
@@ -378,7 +412,19 @@
                     const results = analyzeData(parsed);
                     displayResults(results);
                 } catch (error) {
-                    alert('Error parsing file: ' + error.message);
+                    document.getElementById('results').innerHTML = `
+                        <div class="bg-red-900/20 border border-red-500/50 rounded-lg p-4">
+                            <div class="flex items-center gap-2 mb-2">
+                                <svg class="w-5 h-5 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                </svg>
+                                <h3 class="font-bold text-red-400">PARSING ERROR</h3>
+                            </div>
+                            <p class="text-red-200">${error.message}</p>
+                            <p class="text-red-300 text-sm mt-2">Check: delimiter format, header structure, or data integrity.</p>
+                        </div>
+                    `;
+                    document.getElementById('results').classList.remove('hidden');
                 }
                 document.getElementById('loading').classList.add('hidden');
             }, 500);
