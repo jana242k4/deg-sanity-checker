@@ -28,26 +28,31 @@
                 <svg class="w-8 h-8 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
                 </svg>
-                <h1 class="text-3xl font-bold">DEG Sanity Checker</h1>
+                <h1 class="text-3xl font-bold">RNA-seq QC Dashboard</h1>
             </div>
-            <p class="text-slate-400">Quality control for differential expression analysis</p>
+            <p class="text-slate-400">Pre-DEG sanity checker for count matrices</p>
         </div>
 
         <!-- Upload Section -->
         <div class="bg-slate-800/50 backdrop-blur border border-slate-700 rounded-lg p-6 mb-6">
-            <div class="grid md:grid-cols-2 gap-4 mb-4">
-                <div>
-                    <label class="block text-sm font-medium mb-2">Count Matrix (CSV/TSV)</label>
-                    <input type="file" id="countFile" accept=".csv,.tsv,.txt" class="w-full px-4 py-3 bg-slate-700/50 border border-slate-600 rounded-lg text-sm focus:outline-none focus:border-cyan-500">
-                </div>
-                <div>
-                    <label class="block text-sm font-medium mb-2">Metadata (Optional)</label>
-                    <input type="file" id="metaFile" accept=".csv,.tsv,.txt" class="w-full px-4 py-3 bg-slate-700/50 border border-slate-600 rounded-lg text-sm focus:outline-none focus:border-cyan-500">
-                </div>
+            <div class="mb-4">
+                <label class="block text-sm font-medium mb-2">Count Matrix (CSV/TSV/featureCounts)</label>
+                <input type="file" id="countFile" accept=".csv,.tsv,.txt" class="w-full px-4 py-3 bg-slate-700/50 border border-slate-600 rounded-lg text-sm focus:outline-none focus:border-cyan-500">
+                <p class="text-xs text-slate-500 mt-2">Accepts: standard matrix OR featureCounts output</p>
             </div>
             <button id="demoBtn" class="w-full py-2 bg-cyan-600 hover:bg-cyan-500 rounded-lg font-medium transition-colors">
                 Run Demo Analysis
             </button>
+        </div>
+
+        <!-- Format Detection -->
+        <div id="formatInfo" class="hidden bg-blue-900/20 border border-blue-500/50 rounded-lg p-4 mb-6">
+            <div class="flex items-center gap-2">
+                <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                <span id="formatText" class="text-blue-200 text-sm"></span>
+            </div>
         </div>
 
         <!-- Loading -->
@@ -61,95 +66,195 @@
 
         <!-- Footer -->
         <div class="mt-8 text-center text-sm text-slate-500">
-            <p>Upload count matrix to detect: batch effects · low n bias · normalization issues · extreme outliers</p>
+            <p>Checks: sample balance · sequencing depth · library size · count distribution · normalization needs</p>
         </div>
     </div>
 
     <script>
-        let metadataGlobal = null;
+        function detectFormat(rows) {
+            // Check if featureCounts format
+            if (rows[0][0] === 'Geneid' || rows[0][0] === 'GeneID' || rows[0][0] === 'gene_id') {
+                return 'featureCounts';
+            }
+            // Check if first column has typical gene names
+            if (rows.length > 1 && /^(ENS|NM_|Gene|gene)/.test(rows[1][0])) {
+                return 'standard';
+            }
+            return 'standard';
+        }
 
-        function analyzeData(countMatrix, metadata) {
+        function parseCountMatrix(rows) {
+            const format = detectFormat(rows);
+            let geneCol = 0;
+            let dataStartCol = 1;
+            let headerRow = 0;
+            let dataStartRow = 1;
+
+            if (format === 'featureCounts') {
+                geneCol = 0;
+                dataStartCol = 6; // featureCounts: cols 1-5 are metadata (Chr, Start, End, Strand, Length)
+                headerRow = 0;
+                dataStartRow = 1;
+                
+                document.getElementById('formatInfo').classList.remove('hidden');
+                document.getElementById('formatText').textContent = 
+                    `Detected: featureCounts output (skipping metadata columns 1-5)`;
+            } else {
+                document.getElementById('formatInfo').classList.remove('hidden');
+                document.getElementById('formatText').textContent = 
+                    `Detected: Standard count matrix`;
+            }
+
+            // Extract sample names from header
+            const sampleNames = rows[headerRow].slice(dataStartCol);
+            
+            // Extract count data
+            const countData = [];
+            for (let i = dataStartRow; i < rows.length; i++) {
+                if (rows[i].length <= dataStartCol) continue;
+                const geneName = rows[i][geneCol];
+                const counts = rows[i].slice(dataStartCol).map(c => parseFloat(c) || 0);
+                if (geneName && counts.some(c => c > 0)) {
+                    countData.push({ gene: geneName, counts: counts });
+                }
+            }
+
+            return { sampleNames, countData, format };
+        }
+
+        function analyzeData(parsedData) {
+            const { sampleNames, countData } = parsedData;
             const flags = [];
             const warnings = [];
             const passed = [];
+            const info = [];
 
-            // Sample size check
-            const sampleCount = countMatrix[0].length - 1;
+            const sampleCount = sampleNames.length;
+            const geneCount = countData.length;
+
+            // SAMPLE SIZE CHECK (assumes balanced design)
             if (sampleCount < 6) {
-                flags.push({ msg: `Low sample size (n=${sampleCount}). Need ≥3 per group.` });
+                flags.push({ msg: `Low sample count (n=${sampleCount}). Minimum: 6 (3 per group).` });
             } else if (sampleCount < 10) {
-                warnings.push({ msg: `Marginal sample size (n=${sampleCount}). Power may be limited.` });
+                warnings.push({ msg: `Marginal sample count (n=${sampleCount}). Power limited.` });
             } else {
-                passed.push({ msg: `Sample size adequate (n=${sampleCount})` });
+                passed.push({ msg: `Sample count adequate (n=${sampleCount})` });
             }
 
-            // Check for extreme zeros
-            let totalGenes = countMatrix.length - 1;
-            let zeroGenes = 0;
-            for (let i = 1; i < countMatrix.length; i++) {
-                let zeros = 0;
-                for (let j = 1; j < countMatrix[i].length; j++) {
-                    if (parseFloat(countMatrix[i][j]) === 0) zeros++;
-                }
-                if (zeros / (countMatrix[i].length - 1) > 0.8) zeroGenes++;
-            }
+            // Check if values look normalized (not raw counts)
+            let maxCountAcrossAll = 0;
+            let sumAllCounts = 0;
+            let countValues = 0;
             
-            const zeroPercent = ((zeroGenes / totalGenes) * 100).toFixed(1);
-            if (zeroPercent > 50) {
-                flags.push({ msg: `${zeroPercent}% genes have >80% zeros. Poor sequencing depth.` });
-            } else if (zeroPercent > 30) {
-                warnings.push({ msg: `${zeroPercent}% genes have >80% zeros. Consider filtering.` });
+            for (const gene of countData) {
+                for (const count of gene.counts) {
+                    maxCountAcrossAll = Math.max(maxCountAcrossAll, count);
+                    sumAllCounts += count;
+                    countValues++;
+                }
+            }
+            const avgCount = sumAllCounts / countValues;
+
+            if (maxCountAcrossAll < 100 && avgCount < 10) {
+                flags.push({ msg: `Values look normalized (max=${maxCountAcrossAll.toFixed(1)}). Need RAW counts.` });
+            } else if (avgCount < 1) {
+                warnings.push({ msg: `Low average counts (${avgCount.toFixed(2)}). Check sequencing depth.` });
             } else {
-                passed.push({ msg: `Low-expression genes: ${zeroPercent}% (acceptable)` });
+                passed.push({ msg: `Count distribution looks like raw data` });
             }
 
-            // Library size variance
+            // LIBRARY SIZE ANALYSIS
             const libSizes = [];
-            for (let j = 1; j < countMatrix[0].length; j++) {
+            for (let sIdx = 0; sIdx < sampleCount; sIdx++) {
                 let sum = 0;
-                for (let i = 1; i < countMatrix.length; i++) {
-                    sum += parseFloat(countMatrix[i][j]) || 0;
+                for (const gene of countData) {
+                    sum += gene.counts[sIdx];
                 }
                 libSizes.push(sum);
             }
+
             const meanLib = libSizes.reduce((a, b) => a + b, 0) / libSizes.length;
             const maxLib = Math.max(...libSizes);
             const minLib = Math.min(...libSizes);
-            const cv = Math.sqrt(libSizes.reduce((sum, val) => sum + Math.pow(val - meanLib, 2), 0) / libSizes.length) / meanLib;
-            
+            const stdLib = Math.sqrt(libSizes.reduce((sum, val) => sum + Math.pow(val - meanLib, 2), 0) / libSizes.length);
+            const cv = stdLib / meanLib;
+
+            info.push({ msg: `Library sizes: ${(minLib/1e6).toFixed(2)}M - ${(maxLib/1e6).toFixed(2)}M (mean: ${(meanLib/1e6).toFixed(2)}M)` });
+
             if (maxLib / minLib > 10) {
                 flags.push({ msg: `Library size ratio ${(maxLib/minLib).toFixed(1)}x. Normalization critical.` });
             } else if (cv > 0.5) {
-                warnings.push({ msg: `Library size CV=${(cv*100).toFixed(1)}%. Check normalization.` });
+                warnings.push({ msg: `Library size CV=${(cv*100).toFixed(1)}%. Review normalization.` });
             } else {
                 passed.push({ msg: `Library sizes balanced (CV=${(cv*100).toFixed(1)}%)` });
             }
 
-            // Batch effect check
-            if (metadata && metadata.length > 1) {
-                const batches = new Set(metadata.slice(1).map(row => row[2]));
-                if (batches.size > 1 && batches.size === metadata.length - 1) {
-                    warnings.push({ msg: `Each sample has unique batch. Confounded with condition.` });
-                } else if (batches.size > 1) {
-                    passed.push({ msg: `Batch structure detected. Ensure batch correction.` });
-                }
+            // ZERO-INFLATION CHECK
+            let lowExpressGenes = 0;
+            for (const gene of countData) {
+                const zeros = gene.counts.filter(c => c === 0).length;
+                if (zeros / sampleCount > 0.8) lowExpressGenes++;
             }
 
-            // Simulated extreme log2FC check
-            const simulatedFC = Array.from({length: 50}, () => (Math.random() - 0.5) * 12);
-            const extremeFC = simulatedFC.filter(fc => Math.abs(fc) > 8).length;
-            if (extremeFC > 5) {
-                warnings.push({ msg: `${extremeFC} genes with |log2FC| > 8. Verify biological relevance.` });
+            const zeroPercent = ((lowExpressGenes / geneCount) * 100).toFixed(1);
+            if (zeroPercent > 50) {
+                flags.push({ msg: `${zeroPercent}% genes have >80% zeros. Poor depth or wrong tissue.` });
+            } else if (zeroPercent > 30) {
+                warnings.push({ msg: `${zeroPercent}% genes sparse. Filter before DEG analysis.` });
             } else {
-                passed.push({ msg: `No extreme fold changes detected` });
+                passed.push({ msg: `Low-expression genes: ${zeroPercent}% (acceptable)` });
             }
 
-            return { flags, warnings, passed, libSizes, sampleCount };
+            // GENE FILTERING RECOMMENDATION
+            const filterableGenes = countData.filter(gene => {
+                const nonZero = gene.counts.filter(c => c > 0).length;
+                return nonZero < 3; // Genes expressed in <3 samples
+            }).length;
+
+            if (filterableGenes > geneCount * 0.3) {
+                info.push({ msg: `Recommend filtering ${filterableGenes} genes (< 3 samples expressed)` });
+            }
+
+            // MEAN-VARIANCE RELATIONSHIP (simplified)
+            const meanVarPairs = [];
+            for (const gene of countData.slice(0, Math.min(500, geneCount))) {
+                const mean = gene.counts.reduce((a, b) => a + b, 0) / sampleCount;
+                const variance = gene.counts.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / sampleCount;
+                if (mean > 0) meanVarPairs.push({ mean, variance });
+            }
+
+            // Check if variance roughly follows Poisson (var ≈ mean) or overdispersed (var > mean)
+            let overdispersedCount = 0;
+            for (const pair of meanVarPairs) {
+                if (pair.variance > pair.mean * 5) overdispersedCount++;
+            }
+            const overdispersedPct = (overdispersedCount / meanVarPairs.length * 100).toFixed(1);
+
+            if (overdispersedPct > 60) {
+                warnings.push({ msg: `${overdispersedPct}% genes overdispersed. Use negative binomial models (DESeq2/edgeR).` });
+            } else {
+                passed.push({ msg: `Variance structure appropriate for standard models` });
+            }
+
+            return { flags, warnings, passed, info, libSizes, sampleNames, geneCount };
         }
 
         function displayResults(results) {
             const container = document.getElementById('results');
             container.innerHTML = '';
+
+            // Info bar
+            if (results.info.length > 0) {
+                container.innerHTML += `
+                    <div class="bg-slate-800/50 border border-slate-600 rounded-lg p-4">
+                        <h3 class="font-bold text-slate-300 mb-2">Dataset Summary</h3>
+                        ${results.info.map(item => `
+                            <div class="text-sm text-slate-400 py-1">• ${item.msg}</div>
+                        `).join('')}
+                        <div class="text-sm text-slate-400 py-1">• Total genes: ${results.geneCount}</div>
+                    </div>
+                `;
+            }
 
             // Critical Flags
             if (results.flags.length > 0) {
@@ -219,10 +324,13 @@
                     <div class="flex items-end gap-2 h-32">
                         ${results.libSizes.map((size, i) => {
                             const height = (size / maxSize) * 100;
+                            const sampleName = results.sampleNames[i] || `S${i+1}`;
                             return `
                                 <div class="flex-1 flex flex-col items-center gap-1">
-                                    <div class="w-full bg-cyan-500/80 rounded-t" style="height: ${height}%"></div>
-                                    <span class="text-xs text-slate-400">S${i+1}</span>
+                                    <div class="w-full bg-cyan-500/80 rounded-t transition-all hover:bg-cyan-400" 
+                                         style="height: ${height}%" 
+                                         title="${sampleName}: ${(size/1e6).toFixed(2)}M"></div>
+                                    <span class="text-xs text-slate-400">${sampleName.substring(0, 6)}</span>
                                 </div>
                             `;
                         }).join('')}
@@ -234,8 +342,8 @@
             const grade = results.flags.length === 0 && results.warnings.length === 0 ? 'A+' :
                          results.flags.length === 0 ? 'B' : 'C';
             const gradeColor = grade === 'A+' ? 'text-green-400' : grade === 'B' ? 'text-yellow-400' : 'text-red-400';
-            const gradeText = grade === 'A+' ? 'Analysis quality excellent' :
-                            grade === 'B' ? 'Minor issues detected' : 'Critical issues require attention';
+            const gradeText = grade === 'A+' ? 'Ready for DEG analysis' :
+                            grade === 'B' ? 'Proceed with caution' : 'Fix issues before DEG';
             
             container.innerHTML += `
                 <div class="bg-slate-800/50 border border-slate-700 rounded-lg p-6 text-center">
@@ -249,36 +357,31 @@
             container.classList.remove('hidden');
         }
 
-        function processFile(text, isMetadata = false) {
+        function processFile(text) {
             const rows = text.trim().split('\n').map(row => 
                 row.split(/[,\t]/).map(cell => cell.trim())
             );
             
-            if (isMetadata) {
-                metadataGlobal = rows;
-            } else {
-                document.getElementById('loading').classList.remove('hidden');
-                setTimeout(() => {
-                    const results = analyzeData(rows, metadataGlobal);
+            document.getElementById('loading').classList.remove('hidden');
+            document.getElementById('results').classList.add('hidden');
+            
+            setTimeout(() => {
+                try {
+                    const parsed = parseCountMatrix(rows);
+                    const results = analyzeData(parsed);
                     displayResults(results);
-                    document.getElementById('loading').classList.add('hidden');
-                }, 500);
-            }
+                } catch (error) {
+                    alert('Error parsing file: ' + error.message);
+                }
+                document.getElementById('loading').classList.add('hidden');
+            }, 500);
         }
 
         document.getElementById('countFile').addEventListener('change', (e) => {
             const file = e.target.files[0];
             if (!file) return;
             const reader = new FileReader();
-            reader.onload = (event) => processFile(event.target.result, false);
-            reader.readAsText(file);
-        });
-
-        document.getElementById('metaFile').addEventListener('change', (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = (event) => processFile(event.target.result, true);
+            reader.onload = (event) => processFile(event.target.result);
             reader.readAsText(file);
         });
 
@@ -288,8 +391,11 @@ GAPDH,5420,5890,5120,5340,5670,5230
 TP53,3200,3450,3100,890,920,850
 MYC,1200,1150,1340,2100,2340,2210
 ACTB,4800,4950,4700,4820,4900,4750
-BRCA1,0,0,0,1200,1150,1180`;
-            processFile(demoData, false);
+BRCA1,120,135,128,1200,1150,1180
+CDK1,0,0,0,2300,2450,2380
+FOS,850,920,780,4200,4100,4350
+JUN,0,5,0,1800,1850,1920`;
+            processFile(demoData);
         });
     </script>
 </body>
