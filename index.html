@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DEG Sanity Checker</title>
+    <title>DEG-Ready | Pre-analysis QC for RNA-seq</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         .loader {
@@ -28,9 +28,9 @@
                 <svg class="w-8 h-8 text-cyan-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
                 </svg>
-                <h1 class="text-3xl font-bold">RNA-seq QC Dashboard</h1>
+                <h1 class="text-3xl font-bold">DEG-Ready</h1>
             </div>
-            <p class="text-slate-400">Pre-DEG sanity checker for count matrices</p>
+            <p class="text-slate-400">Pre-analysis sanity checks for RNA-seq count data</p>
         </div>
 
         <!-- Upload Section -->
@@ -145,7 +145,8 @@
                     info: [{ msg: "Upload a proper count matrix or featureCounts output." }],
                     libSizes: [],
                     sampleNames: [],
-                    geneCount: countData.length
+                    geneCount: countData.length,
+                    notes: []
                 };
             }
 
@@ -157,7 +158,8 @@
                     info: [],
                     libSizes: [],
                     sampleNames,
-                    geneCount: 0
+                    geneCount: 0,
+                    notes: []
                 };
             }
 
@@ -265,7 +267,46 @@
                 passed.push({ msg: `Variance structure appropriate for standard models` });
             }
 
-            return { flags, warnings, passed, info, libSizes, sampleNames, geneCount };
+            // CONTEXTUAL NOTES - analyst perspective
+            const notes = [];
+
+            // A. Toy/Pilot dataset
+            if (geneCount < 1000 || meanLib < 0.5e6) {
+                notes.push('This appears to be a small or pilot dataset. QC results are valid, but statistical power and biological conclusions may be limited.');
+            }
+
+            // B. Small but balanced libraries
+            if (meanLib < 1e6 && cv < 0.2 && flags.length === 0) {
+                notes.push('Library sizes are small but well balanced. Suitable for method testing or pilot analysis, not for robust DEG discovery.');
+            }
+
+            // C. Moderate imbalance but salvageable
+            if (maxLib / minLib >= 5 && maxLib / minLib <= 10 && minLib > 0.5e6) {
+                notes.push('Moderate library size imbalance detected. Modern normalization methods (DESeq2 size factors or edgeR TMM) should mitigate this, but inspect PCA carefully.');
+            }
+
+            // D. High sparsity but tissue-plausible
+            const zeroPercentNum = parseFloat(((lowExpressGenes / geneCount) * 100).toFixed(1));
+            if (zeroPercentNum >= 30 && zeroPercentNum <= 60 && geneCount > 20000 && meanLib > 5e6) {
+                notes.push('Elevated sparsity may reflect tissue-specific expression rather than technical failure. Filtering low-expression genes is recommended.');
+            }
+
+            // E. Overdispersion is expected
+            if (overdispersedPct > 60 && flags.length === 0) {
+                notes.push('Overdispersion is expected in RNA-seq data and supports the use of negative binomial models.');
+            }
+
+            // F. Minimum sample size
+            if (sampleCount === 6 && cv < 0.5 && flags.length === 0) {
+                notes.push('Minimum recommended sample size for DEG analysis. Results may be sensitive to outliers.');
+            }
+
+            // G. Clean dataset
+            if (flags.length === 0 && warnings.length === 0) {
+                notes.push('Dataset shows no major QC concerns. Suitable for downstream differential expression analysis.');
+            }
+
+            return { flags, warnings, passed, info, libSizes, sampleNames, geneCount, notes };
         }
 
         function displayResults(results) {
@@ -345,6 +386,26 @@
                 `;
             }
 
+            // Contextual Notes (only if no critical flags or parsing errors)
+            if (results.notes && results.notes.length > 0 && results.flags.length < 3) {
+                container.innerHTML += `
+                    <div class="bg-blue-900/10 border border-blue-500/30 rounded-lg p-4">
+                        <div class="flex items-center gap-2 mb-3">
+                            <svg class="w-5 h-5 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            <h3 class="font-bold text-blue-300">Analyst Notes</h3>
+                        </div>
+                        ${results.notes.map(note => `
+                            <div class="flex items-start gap-2 py-2 border-t border-blue-500/20 first:border-0">
+                                <span class="text-blue-400 font-mono text-sm mt-0.5">ℹ</span>
+                                <span class="text-blue-100 text-sm">${note}</span>
+                            </div>
+                        `).join('')}
+                    </div>
+                `;
+            }
+
             // Library Size Visualization
             const maxSize = Math.max(...results.libSizes);
             container.innerHTML += `
@@ -371,8 +432,8 @@
             const grade = results.flags.length === 0 && results.warnings.length === 0 ? 'A+' :
                          results.flags.length === 0 ? 'B' : 'C';
             const gradeColor = grade === 'A+' ? 'text-green-400' : grade === 'B' ? 'text-yellow-400' : 'text-red-400';
-            const gradeText = grade === 'A+' ? 'Ready for DEG analysis' :
-                            grade === 'B' ? 'Proceed with caution' : 'Fix issues before DEG';
+            const gradeText = grade === 'A+' ? 'Ready for differential expression' :
+                            grade === 'B' ? 'Review warnings before proceeding' : 'Address critical issues first';
             
             container.innerHTML += `
                 <div class="bg-slate-800/50 border border-slate-700 rounded-lg p-6 text-center">
