@@ -74,17 +74,22 @@
         function detectFormat(rows) {
             // Find header row (handles comment lines)
             const headerIdx = rows.findIndex(r => 
-                r.some(cell => cell === 'Geneid' || cell === 'GeneID' || cell === 'gene_id')
+                r.some(cell => cell === 'Geneid' || cell === 'GeneID' || cell === 'gene_id' || cell === 'gene' || cell === 'gene_name')
             );
             
             if (headerIdx >= 0) {
                 const header = rows[headerIdx];
                 if (header.includes('Chr') && header.includes('Length') && header.includes('Strand')) {
-                    return { type: 'featureCounts', headerIdx };
+                    return { type: 'featureCounts', headerIdx, assumedHeader: false };
                 }
             }
             
-            return { type: 'standard', headerIdx: 0 };
+            // Fallback: assume row 0 is header but flag it
+            if (headerIdx === -1) {
+                return { type: 'standard', headerIdx: 0, assumedHeader: true };
+            }
+            
+            return { type: 'standard', headerIdx: headerIdx >= 0 ? headerIdx : 0, assumedHeader: headerIdx === -1 };
         }
 
         function parseCountMatrix(rows) {
@@ -103,8 +108,13 @@
                     `Detected: featureCounts output (header at row ${headerRow + 1}, skipping cols 1-6)`;
             } else {
                 document.getElementById('formatInfo').classList.remove('hidden');
-                document.getElementById('formatText').textContent = 
-                    `Detected: Standard count matrix`;
+                if (formatInfo.assumedHeader) {
+                    document.getElementById('formatText').textContent = 
+                        `Detected: Standard matrix (header assumed at row 1 - verify column structure)`;
+                } else {
+                    document.getElementById('formatText').textContent = 
+                        `Detected: Standard count matrix`;
+                }
             }
 
             // Extract sample names from header
@@ -176,18 +186,25 @@
             let maxCountAcrossAll = 0;
             let sumAllCounts = 0;
             let countValues = 0;
+            let allCountsAreIntegers = true;
             
             for (const gene of countData) {
                 for (const count of gene.counts) {
                     maxCountAcrossAll = Math.max(maxCountAcrossAll, count);
                     sumAllCounts += count;
                     countValues++;
+                    if (!Number.isInteger(count) && count !== 0) {
+                        allCountsAreIntegers = false;
+                    }
                 }
             }
             const avgCount = sumAllCounts / countValues;
 
-            if (maxCountAcrossAll < 100 && avgCount < 10) {
+            // Improved detection: fractional values indicate normalization
+            if (maxCountAcrossAll < 100 && avgCount < 10 && !allCountsAreIntegers) {
                 flags.push({ msg: `Values look normalized (max=${maxCountAcrossAll.toFixed(1)}). Need RAW counts.` });
+            } else if (maxCountAcrossAll < 100 && avgCount < 10 && allCountsAreIntegers) {
+                warnings.push({ msg: `Very low counts (max=${maxCountAcrossAll.toFixed(0)}). Check sequencing depth.` });
             } else if (avgCount < 1) {
                 warnings.push({ msg: `Low average counts (${avgCount.toFixed(2)}). Check sequencing depth.` });
             } else {
@@ -207,12 +224,18 @@
             const meanLib = libSizes.reduce((a, b) => a + b, 0) / libSizes.length;
             const maxLib = Math.max(...libSizes);
             const minLib = Math.min(...libSizes);
+            
+            // Safety check for zero library sizes
+            if (minLib === 0) {
+                flags.push({ msg: `One or more samples have zero total counts. Remove failed libraries.` });
+            }
+            
             const stdLib = Math.sqrt(libSizes.reduce((sum, val) => sum + Math.pow(val - meanLib, 2), 0) / libSizes.length);
             const cv = stdLib / meanLib;
 
             info.push({ msg: `Library sizes: ${(minLib/1e6).toFixed(2)}M - ${(maxLib/1e6).toFixed(2)}M (mean: ${(meanLib/1e6).toFixed(2)}M)` });
 
-            if (maxLib / minLib > 10) {
+            if (minLib > 0 && maxLib / minLib > 10) {
                 flags.push({ msg: `Library size ratio ${(maxLib/minLib).toFixed(1)}x. Normalization critical.` });
             } else if (cv > 0.5) {
                 warnings.push({ msg: `Library size CV=${(cv*100).toFixed(1)}%. Review normalization.` });
@@ -228,8 +251,10 @@
             }
 
             const zeroPercent = ((lowExpressGenes / geneCount) * 100).toFixed(1);
-            if (zeroPercent > 50) {
+            if (zeroPercent > 70) {
                 flags.push({ msg: `${zeroPercent}% genes have >80% zeros. Poor depth or wrong tissue.` });
+            } else if (zeroPercent > 50) {
+                warnings.push({ msg: `${zeroPercent}% genes have >80% zeros. May reflect tissue specificity or depth issues.` });
             } else if (zeroPercent > 30) {
                 warnings.push({ msg: `${zeroPercent}% genes sparse. Filter before DEG analysis.` });
             } else {
@@ -243,20 +268,23 @@
             }).length;
 
             if (filterableGenes > geneCount * 0.3) {
-                info.push({ msg: `Recommend filtering ${filterableGenes} genes (< 3 samples expressed)` });
+                info.push({ msg: `Consider filtering ${filterableGenes} genes (expressed in <3 samples). Standard: CPM <1 in ≥${sampleCount-1} samples` });
             }
 
             // MEAN-VARIANCE RELATIONSHIP (simplified)
             const meanVarPairs = [];
             for (const gene of countData.slice(0, Math.min(500, geneCount))) {
                 const mean = gene.counts.reduce((a, b) => a + b, 0) / sampleCount;
-                const variance = gene.counts.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / sampleCount;
+                // Use sample variance (n-1) for unbiased estimate, especially important for small n
+                const variance = gene.counts.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / (sampleCount - 1);
                 if (mean > 0) meanVarPairs.push({ mean, variance });
             }
 
             // Check if variance roughly follows Poisson (var ≈ mean) or overdispersed (var > mean)
             let overdispersedCount = 0;
             for (const pair of meanVarPairs) {
+                // Factor of 5 chosen as heuristic to flag strong overdispersion
+                // (variance substantially exceeds mean, indicating need for negative binomial)
                 if (pair.variance > pair.mean * 5) overdispersedCount++;
             }
             const overdispersedPct = (overdispersedCount / meanVarPairs.length * 100).toFixed(1);
@@ -301,7 +329,12 @@
                 notes.push('Minimum recommended sample size for DEG analysis. Results may be sensitive to outliers.');
             }
 
-            // G. Clean dataset
+            // G. Unbalanced design awareness
+            if (sampleCount > 3 && sampleCount % 2 !== 0) {
+                notes.push('Odd sample count detected. If groups are unequal, ensure design formula accounts for imbalance in DESeq2/edgeR.');
+            }
+
+            // H. Clean dataset
             if (flags.length === 0 && warnings.length === 0) {
                 notes.push('Dataset shows no major QC concerns. Suitable for downstream differential expression analysis.');
             }
@@ -441,22 +474,107 @@
                         <span class="${gradeColor}">${grade}</span>
                     </div>
                     <p class="text-slate-400">${gradeText}</p>
+                    ${grade === 'A+' || grade === 'B' ? `
+                        <p class="text-slate-500 text-sm mt-3">
+                            Recommended next: DESeq2 → sizeFactors → PCA → DEG
+                        </p>
+                    ` : ''}
+                    <button id="exportBtn" class="mt-4 px-4 py-2 bg-slate-700 hover:bg-slate-600 text-sm rounded transition-colors">
+                        Download QC Report (TXT)
+                    </button>
                 </div>
             `;
 
+            // Add export functionality
+            setTimeout(() => {
+                document.getElementById('exportBtn').addEventListener('click', () => {
+                    exportReport(results);
+                });
+            }, 100);
+
             container.classList.remove('hidden');
+        }
+
+        function exportReport(results) {
+            const timestamp = new Date().toISOString().split('T')[0];
+            let report = `DEG-Ready QC Report
+Generated: ${new Date().toLocaleString()}
+========================================
+
+DATASET SUMMARY
+---------------
+${results.info.map(i => i.msg).join('\n')}
+Total genes: ${results.geneCount}
+Total samples: ${results.sampleNames.length}
+Samples: ${results.sampleNames.join(', ')}
+
+`;
+
+            if (results.flags.length > 0) {
+                report += `CRITICAL ISSUES
+---------------
+${results.flags.map(f => '✗ ' + f.msg).join('\n')}
+
+`;
+            }
+
+            if (results.warnings.length > 0) {
+                report += `WARNINGS
+--------
+${results.warnings.map(w => '⚠ ' + w.msg).join('\n')}
+
+`;
+            }
+
+            if (results.passed.length > 0) {
+                report += `PASSED CHECKS
+-------------
+${results.passed.map(p => '✓ ' + p.msg).join('\n')}
+
+`;
+            }
+
+            if (results.notes && results.notes.length > 0) {
+                report += `ANALYST NOTES
+-------------
+${results.notes.map(n => 'ℹ ' + n).join('\n')}
+
+`;
+            }
+
+            report += `LIBRARY SIZES (millions of reads)
+----------------------------------
+${results.sampleNames.map((name, i) => 
+                `${name}: ${(results.libSizes[i] / 1e6).toFixed(2)}M`
+            ).join('\n')}
+
+========================================
+Tool: DEG-Ready v1.0
+Purpose: Pre-analysis sanity checks for RNA-seq count data
+`;
+
+            const blob = new Blob([report], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `DEG-Ready_QC_Report_${timestamp}.txt`;
+            a.click();
+            URL.revokeObjectURL(url);
         }
 
         function processFile(text) {
             // First, filter out comment lines starting with #
             const lines = text.trim().split('\n').filter(line => line.trim().length > 0);
             
-            // Parse rows - support CSV, TSV, and space-delimited
+            // Parse rows - improved delimiter detection
             const rows = lines.map(line => {
-                // Try to detect delimiter
-                if (line.includes('\t')) {
+                // Count delimiter occurrences for more robust detection
+                const tabCount = (line.match(/\t/g) || []).length;
+                const commaCount = (line.match(/,/g) || []).length;
+                
+                if (tabCount > commaCount) {
                     return line.split('\t').map(cell => cell.trim());
-                } else if (line.includes(',')) {
+                } else if (commaCount > 0) {
                     return line.split(',').map(cell => cell.trim());
                 } else {
                     // Space-delimited (featureCounts default)
